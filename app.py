@@ -1,191 +1,317 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from elasticsearch import Elasticsearch
+import pandas as pd
 
-# Load environment variables from .env file
+# Load environment variables from .env
 load_dotenv()
 
 ELASTICSEARCH_HOST = os.getenv("ELASTICSEARCH_HOST")
 ELASTICSEARCH_USER = os.getenv("ELASTICSEARCH_USER")
 ELASTICSEARCH_PASSWORD = os.getenv("ELASTICSEARCH_PASSWORD")
-ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX", "condor_data")  # default name if needed
+ELASTICSEARCH_INDEX = os.getenv("ELASTICSEARCH_INDEX", "condor_data")
 
-# Create Elasticsearch client
+# Initialize Elasticsearch client
 es = Elasticsearch(
     [ELASTICSEARCH_HOST],
     http_auth=(ELASTICSEARCH_USER, ELASTICSEARCH_PASSWORD),
-    # If using HTTPS, you may need additional SSL configuration
-    # e.g., verify_certs=False, ssl_show_warn=False
+    # If you need SSL verification, set verify_certs=True, etc.
+    verify_certs=False
 )
 
-###############################################################################
-# Streamlit App
-###############################################################################
-st.title("Flight Search")
+def build_base_query(
+    destination: str,
+    origin_exclusions: list,
+    flight_type: str,
+    min_date_val,
+    max_date_val,
+    date_retrieved_val,
+    concrete_date_val
+):
+    """
+    Builds the "base" part of the Elasticsearch query (a bool query).
+    """
+    must_clauses = []
+    must_not_clauses = []
 
-# 1) Destination code (required)
-destination_code = st.text_input("Destination code (required)", value="", help="Example: PUJ").strip()
+    # 1) Required: Destination
+    must_clauses.append({"term": {"destination": destination}})
 
-# 2) Comma-separated list of origin codes to exclude (optional)
-excluded_origins_input = st.text_input("Excluded origin codes (comma separated, optional)", value="").strip()
+    # 2) Optional: list of origin codes to exclude
+    if origin_exclusions:
+        must_not_clauses.append({"terms": {"origin": origin_exclusions}})
 
-# 3) Type (roundtrip/oneway) (optional)
-flight_type = st.selectbox("Flight type (optional)", ["", "oneway", "roundtrip"])
+    # 3) Required flight type (oneway/roundtrip)
+    must_clauses.append({"term": {"type": flight_type}})
 
-# 4) Minimum and maximum date (optional)
-col1, col2 = st.columns(2)
-with col1:
-    min_date = st.date_input("Minimum date (optional)", value=None)
-with col2:
-    max_date = st.date_input("Maximum date (optional)", value=None)
+    # 4) date_retrieved (default today) - treat as exact match
+    #    The user will enter e.g. '20250117' format.
+    if date_retrieved_val:
+        must_clauses.append({
+            "term": {"date_retrieved": date_retrieved_val}
+        })
 
-# 5) date_retrieved (default today)
-date_retrieved_input = st.date_input("Date retrieved", value=date.today())
+    # 5) If a concrete date is provided, we'll ignore min/max date
+    if concrete_date_val:
+        must_clauses.append({"term": {"date": concrete_date_val}})
+    else:
+        # Use a range if min_date_val or max_date_val is provided
+        date_range = {}
+        if min_date_val:
+            date_range["gte"] = min_date_val.strftime("%Y%m%d")
+        if max_date_val:
+            date_range["lte"] = max_date_val.strftime("%Y%m%d")
 
-# 6) Concrete date (optional)
-concrete_date_input = st.date_input("Concrete date (optional)", value=None)
+        if date_range:  # only add if not empty
+            must_clauses.append({"range": {"date": date_range}})
 
-# Button to trigger search
-if st.button("Search"):
-    if not destination_code:
-        st.error("Destination code is required.")
-        st.stop()
+    # Build the final query
+    base_query = {
+        "bool": {
+            "must": must_clauses,
+            "must_not": must_not_clauses
+        }
+    }
 
-    ###############################################################################
-    # Build Elasticsearch query
-    ###############################################################################
-    filters = []
+    return base_query
 
-    # Must: Destination code
-    filters.append({"term": {"destination": destination_code}})
+def search_elasticsearch(query_body, size=1000):
+    """
+    Executes a search against Elasticsearch with the provided query body.
+    """
+    response = es.search(
+        index=ELASTICSEARCH_INDEX,
+        body={
+            "query": query_body,
+            # Sort by price ascending for easy retrieval of cheapest
+            "sort": [
+                {"price": {"order": "asc"}}
+            ],
+            "size": size
+        }
+    )
 
-    # Excluded origins (if provided)
-    if excluded_origins_input:
-        excluded_origins = [o.strip() for o in excluded_origins_input.split(",") if o.strip()]
-        if excluded_origins:
-            # Use must_not to exclude these origins
-            filters.append({
-                "bool": {
-                    "must_not": [
-                        {"terms": {"origin": excluded_origins}}
-                    ]
-                }
-            })
+    # Extract hits
+    hits = response.get("hits", {}).get("hits", [])
+    # Return _source merged with doc id for convenience
+    data = [dict(hit["_source"], _id=hit["_id"]) for hit in hits]
+    return data
 
-    # Flight type (if provided)
-    if flight_type:
-        filters.append({"term": {"type": flight_type}})
-
-    # Min date (if provided)
-    if min_date:
-        filters.append({"range": {"date": {"gte": min_date.strftime("%Y%m%d")}}})
-
-    # Max date (if provided)
-    if max_date:
-        filters.append({"range": {"date": {"lte": max_date.strftime("%Y%m%d")}}})
-
-    # date_retrieved (default today)
-    if date_retrieved_input:
-        filters.append({"term": {"date_retrieved": date_retrieved_input.strftime("%Y%m%d")}})
-
-    # Concrete date (if provided)
-    if concrete_date_input:
-        filters.append({"term": {"date": concrete_date_input.strftime("%Y%m%d")}})
-
-    # Combine filters into a bool query
+def get_previous_day_price(
+    origin: str,
+    destination: str,
+    flight_date: str,
+    flight_type: str,
+    prev_date_retrieved: str
+):
+    """
+    Retrieve the price for the same flight (origin, destination, date, type)
+    on the previous day 'date_retrieved'. Return None if not found.
+    """
     query = {
         "bool": {
-            "must": filters
+            "must": [
+                {"term": {"origin": origin}},
+                {"term": {"destination": destination}},
+                {"term": {"date": flight_date}},
+                {"term": {"type": flight_type}},
+                {"term": {"date_retrieved": prev_date_retrieved}}
+            ]
         }
     }
 
-    # Search body
-    search_body = {
-        "size": 100,
-        "query": query,
-        "sort": [{"price": {"order": "asc"}}]
-    }
-
-    ###############################################################################
-    # Execute query
-    ###############################################################################
-    try:
-        response = es.search(index=ELASTICSEARCH_INDEX, body=search_body)
-    except Exception as e:
-        st.error(f"Error while searching Elasticsearch: {str(e)}")
-        st.stop()
-
-    if "hits" not in response or "hits" not in response["hits"]:
-        st.write("No records found.")
-        st.stop()
-
-    hits = response["hits"]["hits"]
-
-    ###############################################################################
-    # Process and display results
-    # - Convert price to price/100
-    # - Compute price difference vs previous day (based on date_retrieved)
-    ###############################################################################
-    records = []
-    for hit in hits:
-        doc = hit["_source"]
-        record = {
-            "origin": doc.get("origin", ""),
-            "destination": doc.get("destination", ""),
-            "date": doc.get("date", ""),
-            "date_retrieved": doc.get("date_retrieved", ""),
-            "type": doc.get("type", ""),
-            # real price is price/100
-            "price": doc.get("price", 0) / 100.0,
-            "price_change_vs_previous_day": None
+    resp = es.search(
+        index=ELASTICSEARCH_INDEX,
+        body={
+            "query": query,
+            "size": 1
         }
+    )
+    hits = resp.get("hits", {}).get("hits", [])
+    if not hits:
+        return None
+    # We only asked for 1 doc, so just return the price from the first one
+    return hits[0]["_source"]["price"]
 
-        # Compute price change vs. previous day
-        current_day_str = doc.get("date_retrieved", "")
-        if current_day_str:
-            try:
-                current_day_dt = datetime.strptime(current_day_str, "%Y%m%d")
-                previous_day_str = (current_day_dt - timedelta(days=1)).strftime("%Y%m%d")
+def display_oneway_results(base_query):
+    """
+    Fetch up to 100 cheapest oneway flights and display them.
+    Also calculate price change vs. previous day if available.
+    """
+    results = search_elasticsearch(query_body=base_query, size=100)
 
-                # Look up the record with the same origin/destination/date/type but date_retrieved = previous_day
-                sub_query = {
-                    "bool": {
-                        "must": [
-                            {"term": {"origin": record["origin"]}},
-                            {"term": {"destination": record["destination"]}},
-                            {"term": {"date": record["date"]}},
-                            {"term": {"type": record["type"]}},
-                            {"term": {"date_retrieved": previous_day_str}}
-                        ]
-                    }
-                }
+    # Prepare data for display
+    rows = []
+    # We'll assume date_retrieved is 'YYYYMMDD'. 
+    # We'll try to find the 'previous day' in the same format.
+    # If the user used a single date_retrieved in base_query, we can read it from the query structure,
+    # or from the first doc in results. For simplicity, let's read from the doc itself (assuming all have same date_retrieved).
+    for doc in results:
+        origin = doc.get("origin")
+        destination = doc.get("destination")
+        date_retrieved = doc.get("date_retrieved")
+        flight_date = doc.get("date")
+        raw_price = doc.get("price", 0)
+        # Convert price to real price
+        real_price = round(raw_price / 100, 2)
 
-                sub_search_body = {
-                    "size": 1,
-                    "query": sub_query
-                }
+        # Price difference vs previous day
+        try:
+            current_dr = datetime.strptime(date_retrieved, "%Y%m%d")
+            prev_day = (current_dr).replace(day=current_dr.day - 1)  # naive approach
+            prev_date_retrieved_str = prev_day.strftime("%Y%m%d")
+        except ValueError:
+            # If there's some date parsing error, skip difference
+            prev_date_retrieved_str = None
 
+        if prev_date_retrieved_str:
+            prev_price = get_previous_day_price(
+                origin=origin,
+                destination=destination,
+                flight_date=flight_date,
+                flight_type=doc.get("type"),
+                prev_date_retrieved=prev_date_retrieved_str
+            )
+            if prev_price is not None:
+                price_diff = round((raw_price - prev_price) / 100, 2)
+            else:
+                price_diff = None
+        else:
+            price_diff = None
+
+        rows.append({
+            "origin": origin,
+            "destination": destination,
+            "date_retrieved": date_retrieved,
+            "date": flight_date,
+            "price": real_price,
+            "type": doc.get("type"),
+            "price_change_vs_previous_day": price_diff if price_diff is not None else "N/A"
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df)
+
+def display_roundtrip_results(base_query):
+    """
+    For roundtrip, we fetch two sets:
+     - set1 (direction=forth)
+     - set2 (direction=back)
+    Then, combine them to find the 100 cheapest sums.
+    """
+    # Make copies of base_query so we can add direction constraints
+    import copy
+    forth_query = copy.deepcopy(base_query)
+    forth_query["bool"]["must"].append({"term": {"direction": "forth"}})
+
+    back_query = copy.deepcopy(base_query)
+    back_query["bool"]["must"].append({"term": {"direction": "back"}})
+
+    # Fetch results
+    set1 = search_elasticsearch(forth_query, size=1000)  # might fetch more, then filter
+    set2 = search_elasticsearch(back_query, size=1000)
+
+    # We want to find valid pairs:
+    #  item1.destination = item2.destination
+    #  item1.origin = item2.origin
+    #  item2.date > item1.date
+    # Then sum price (lowest 100).
+    # For better efficiency, you could index by (origin, destination) etc. 
+    # For demonstration, we'll do a naive nested loop.  
+
+    pairs = []
+    for f in set1:
+        for b in set2:
+            if (
+                f.get("origin") == b.get("origin") and
+                f.get("destination") == b.get("destination")
+            ):
+                # Compare date fields as strings "YYYYMMDD" => convert to date
                 try:
-                    sub_response = es.search(index=ELASTICSEARCH_INDEX, body=sub_search_body)
-                    if sub_response["hits"]["total"]["value"] > 0:
-                        prev_price_raw = sub_response["hits"]["hits"][0]["_source"]["price"]
-                        prev_price = prev_price_raw / 100.0
-                        record["price_change_vs_previous_day"] = record["price"] - prev_price
-                except Exception as sub_e:
-                    # If there's an error, just ignore the price difference
-                    pass
+                    f_date = datetime.strptime(f["date"], "%Y%m%d")
+                    b_date = datetime.strptime(b["date"], "%Y%m%d")
+                except ValueError:
+                    continue
 
-            except ValueError:
-                # If parsing current_day_str as a date fails, ignore price difference
-                pass
+                if b_date > f_date:  # date of item2 is higher than date of item1
+                    total_price = f["price"] + b["price"]
+                    pairs.append({
+                        "origin": f["origin"],
+                        "destination": f["destination"],
+                        "forth_date": f["date"],
+                        "back_date": b["date"],
+                        "forth_price": round(f["price"] / 100, 2),
+                        "back_price": round(b["price"] / 100, 2),
+                        "total_price": round(total_price / 100, 2)
+                    })
 
-        records.append(record)
+    # sort by total_price ascending
+    pairs.sort(key=lambda x: x["total_price"])
+    # take top 100
+    cheapest_pairs = pairs[:100]
 
-    if not records:
-        st.write("No records found.")
+    df = pd.DataFrame(cheapest_pairs)
+    st.dataframe(df)
+
+def main():
+    st.title("Condor Flight Search")
+
+    # --- SIDEBAR INPUTS ---
+    # 1. Required: Destination code
+    destination = st.sidebar.text_input("Destination (required)")
+
+    # 2. Optional: comma-separated list of origin codes to exclude
+    exclude_origins_str = st.sidebar.text_input("Exclude origin codes (comma-separated, optional)", "")
+    origin_exclusions = []
+    if exclude_origins_str.strip():
+        origin_exclusions = [o.strip().upper() for o in exclude_origins_str.split(",") if o.strip()]
+
+    # 3. Required: type (roundtrip/oneway), default oneway
+    flight_type = st.sidebar.selectbox("Type", ["oneway", "roundtrip"], index=0)
+
+    # 4. Optional: min and max date
+    #    Streamlit date_input returns a datetime.date or a list of them. We'll keep them as date objects.
+    min_date_val = st.sidebar.date_input("Minimum Date (optional)", value=None)
+    max_date_val = st.sidebar.date_input("Maximum Date (optional)", value=None)
+
+    # If user leaves them empty, it might return today's date (Streamlit behavior),
+    # so we need to check if they've actually chosen a date or not.
+    # For demonstration, we'll just trust that the user picks or not.
+    # If you want truly empty by default, you can do something more sophisticated.
+
+    # 5. date_retrieved (default today)
+    default_date_retrieved = datetime.today().strftime("%Y%m%d")
+    date_retrieved_val = st.sidebar.text_input("Date retrieved (default today)", value=default_date_retrieved)
+
+    # 6. Optional: concrete date
+    concrete_date_str = st.sidebar.text_input("Concrete date YYYYMMDD (optional)", "")
+    concrete_date_val = concrete_date_str.strip() if concrete_date_str.strip() else None
+
+    # Validate required fields
+    if not destination.strip():
+        st.warning("Please provide a destination code.")
+        st.stop()
+
+    # --- BUILD QUERY ---
+    base_query = build_base_query(
+        destination=destination.upper(),
+        origin_exclusions=origin_exclusions,
+        flight_type=flight_type,
+        min_date_val=min_date_val if isinstance(min_date_val, date) else None,
+        max_date_val=max_date_val if isinstance(max_date_val, date) else None,
+        date_retrieved_val=date_retrieved_val,
+        concrete_date_val=concrete_date_val
+    )
+
+    # --- EXECUTE & DISPLAY RESULTS ---
+    if flight_type == "oneway":
+        st.subheader("Oneway Results (100 cheapest)")
+        display_oneway_results(base_query)
     else:
-        st.write(f"Found {len(records)} records (showing up to 100).")
-        # Display as table
-        st.table(records)
+        st.subheader("Roundtrip Results (100 cheapest pairs)")
+        display_roundtrip_results(base_query)
+
+if __name__ == "__main__":
+    main()
