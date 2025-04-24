@@ -37,8 +37,13 @@ def build_base_query(
     must_clauses = []
     must_not_clauses = []
 
-    # 1) Required: Destination
-    must_clauses.append({"term": {"destination": destination}})
+    # 1) Required: Destination(s)
+    # Split destination string into list and handle both single and multiple destinations
+    destinations = [d.strip().upper() for d in destination.split(",") if d.strip()]
+    if len(destinations) == 1:
+        must_clauses.append({"term": {"destination": destinations[0]}})
+    else:
+        must_clauses.append({"terms": {"destination": destinations}})
 
     # 2) Optional: list of origin codes to exclude
     if origin_exclusions:
@@ -264,8 +269,8 @@ def main():
     st.title("Condor Flight Search")
 
     # --- SIDEBAR INPUTS ---
-    # 1. Required: Destination code
-    destination = st.sidebar.text_input("Destination (required)")
+    # 1. Required: Destination code(s)
+    destination = st.sidebar.text_input("Destination(s) (comma-separated, required)")
 
     # 2. Optional: comma-separated list of origin codes to exclude
     exclude_origins_str = st.sidebar.text_input("Exclude origin codes (comma-separated, optional)", "")
