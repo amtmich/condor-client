@@ -24,6 +24,7 @@ es = Elasticsearch(
 def build_base_query(
     destination: str,
     origin_exclusions: list,
+    origin_codes: list,
     flight_type: str,
     min_date_val,
     max_date_val,
@@ -42,6 +43,10 @@ def build_base_query(
     # 2) Optional: list of origin codes to exclude
     if origin_exclusions:
         must_not_clauses.append({"terms": {"origin": origin_exclusions}})
+
+    # 2.1) Optional: list of origin codes to include
+    if origin_codes:
+        must_clauses.append({"terms": {"origin": origin_codes}})
 
     # 3) Required flight type (oneway/roundtrip)
     must_clauses.append({"term": {"type": flight_type}})
@@ -268,10 +273,16 @@ def main():
     if exclude_origins_str.strip():
         origin_exclusions = [o.strip().upper() for o in exclude_origins_str.split(",") if o.strip()]
 
-    # 3. Required: type (roundtrip/oneway), default oneway
+    # 3. Optional: comma-separated list of origin codes to include
+    include_origins_str = st.sidebar.text_input("Include origin codes (comma-separated, optional)", "")
+    origin_codes = []
+    if include_origins_str.strip():
+        origin_codes = [o.strip().upper() for o in include_origins_str.split(",") if o.strip()]
+
+    # 4. Required: type (roundtrip/oneway), default oneway
     flight_type = st.sidebar.selectbox("Type", ["oneway", "roundtrip"], index=0)
 
-    # 4. Optional: min and max date
+    # 5. Optional: min and max date
     #    Streamlit date_input returns a datetime.date or a list of them. We'll keep them as date objects.
     min_date_val = st.sidebar.date_input("Minimum Date (optional)", value=None)
     max_date_val = st.sidebar.date_input("Maximum Date (optional)", value=None)
@@ -281,11 +292,11 @@ def main():
     # For demonstration, we'll just trust that the user picks or not.
     # If you want truly empty by default, you can do something more sophisticated.
 
-    # 5. date_retrieved (default today)
+    # 6. date_retrieved (default today)
     default_date_retrieved = datetime.today().strftime("%Y%m%d")
     date_retrieved_val = st.sidebar.text_input("Date retrieved (default today)", value=default_date_retrieved)
 
-    # 6. Optional: concrete date
+    # 7. Optional: concrete date
     concrete_date_str = st.sidebar.text_input("Concrete date YYYYMMDD (optional)", "")
     concrete_date_val = concrete_date_str.strip() if concrete_date_str.strip() else None
 
@@ -298,6 +309,7 @@ def main():
     base_query = build_base_query(
         destination=destination.upper(),
         origin_exclusions=origin_exclusions,
+        origin_codes=origin_codes,
         flight_type=flight_type,
         min_date_val=min_date_val if isinstance(min_date_val, date) else None,
         max_date_val=max_date_val if isinstance(max_date_val, date) else None,
